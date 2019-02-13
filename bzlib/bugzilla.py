@@ -15,14 +15,22 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+import os
 try:
+    # Python 3
     import urllib.parse as urlparse
 except ImportError:
     import urlparse
 try:
     import xmlrpclib
 except ImportError:
+    # Python 3
     import xmlrpc.client as xmlrpclib
+try:
+    from Cookie import SimpleCookie
+except ImportError:
+    # Python 3
+    from http.cookies import SimpleCookie
 
 from . import bug
 from . import config
@@ -52,8 +60,8 @@ class Bugzilla(object):
 
     __slots__ = [
         '_products', '_fields', '_user_cache',
-        'url', 'user', 'password', 'config',
-        'server',
+        'url', 'user', 'password', 'cookiefile',
+        'config', 'server',
     ]
 
     @classmethod
@@ -93,14 +101,18 @@ class Bugzilla(object):
 
         return cls(**_server)
 
-    def __init__(self, url=None, user=None, password=None, **config):
+    def __init__(self, url=None, user=None, password=None,
+                 cookiefile=None, context=None, **config):
         """Create a Bugzilla XML-RPC client.
 
-        url      : points to a bugzilla instance (base URL; must end in '/')
-        user     : bugzilla username
-        password : bugzilla password
+        url         : points to a bugzilla instance (base URL; must end in '/')
+        user        : bugzilla username
+        password    : bugzilla password
+        cookiefile  : filename to optionally store and retrieve cookies from
+        context     : an ssl.SSLContext object used to configure the SSL
+                      settings of the underlying connection. Only applicable to
+                      HTTPS urls.
         """
-
         self._products = None
         self._fields = None
         self._user_cache = {}
@@ -108,6 +120,7 @@ class Bugzilla(object):
         self.url = url
         self.user = user
         self.password = password
+        self.cookiefile = cookiefile
         self.config = config
 
         parsed_url = urlparse.urlparse(url)
@@ -122,11 +135,28 @@ class Bugzilla(object):
                 'URL params, queries and fragments not supported.'
             )
         url = url + 'xmlrpc.cgi' if url[-1] == '/' else url + '/xmlrpc.cgi'
+
+        handler = xmlrpclib.Transport
+        extra_kwargs = {"use_datetime": True}
+        if cookiefile and parsed_url.scheme == "https":
+            handler = SafeCookiesTransport
+            extra_kwargs["cookiefile"] = cookiefile
+            extra_kwargs["context"] = context
+        elif cookiefile:  # Non-https, but a cookie file was specified
+            handler = CookiesTransport
+            extra_kwargs["cookiefile"] = cookiefile
+        elif parsed_url.scheme == "https":  # Https, but no cookiefile
+            handler = xmlrpclib.SafeTransport
+            extra_kwargs["context"] = context
+        else:  # Non-https and no cookiefile
+            handler = xmlrpclib.Transport
+        transport = handler(**extra_kwargs)
+
         # httplib explodes if url is unicode
         self.server = xmlrpclib.ServerProxy(
             str(url),
-            use_datetime=True,
-            allow_none=True
+            allow_none=True,
+            transport=transport,
         )
 
     def rpc(self, *args, **kwargs):
@@ -135,8 +165,10 @@ class Bugzilla(object):
         args: RPC method, in fragments
         kwargs: RPC parameters
         """
-        kwargs['Bugzilla_login'] = self.user
-        kwargs['Bugzilla_password'] = self.password
+        if self.user:
+            kwargs['Bugzilla_login'] = self.user
+        if self.password:
+            kwargs['Bugzilla_password'] = self.password
 
         method = self.server
         for fragment in args:
@@ -215,3 +247,59 @@ class Bugzilla(object):
                 ', '.join(map(lambda x: x['name'], users))
             ))
         return users[0]
+
+
+class AbstractCookiesTransport:
+    """An Transport subclass that retains cookies over its lifetime and has the
+    ability to store/load cookies in a file.
+
+    Taken from http://stackoverflow.com/a/25876504 and modified to implement
+    cookie file save/load functionality.
+    """
+
+    def __init__(self, cookiefile=None, **kwargs):
+        super().__init__(**kwargs)
+        self.cookiefile = cookiefile
+        self.cookies = SimpleCookie()
+        self.load_cookies()
+
+    def load_cookies(self, cookiefile=None):
+        cookiefile = cookiefile or self.cookiefile
+        if os.path.isfile(cookiefile):
+            with open(cookiefile) as fd:
+                self.cookies.load(fd.read())
+
+    def save_cookies(self, cookiefile=None):
+        cookiefile = cookiefile or self.cookiefile
+        with open(cookiefile, 'w') as fd:
+            fd.write(self.cookies.output(header="", sep="\n"))
+
+    def send_headers(self, connection, headers):
+        if self.cookies:
+            cookies = [
+                "{}={}".format(k,v.value) for k,v in self.cookies.items()
+            ]
+            cookie_str = "; ".join(cookies)
+            connection.putheader("Cookie", cookie_str)
+        super().send_headers(connection, headers)
+
+    def parse_response(self, response):
+        cookies = response.msg.get_all("Set-Cookie") or []
+        for cookie in cookies:
+            self.cookies.load(cookie)  # Add or replace cookie
+        self.save_cookies()
+        return super().parse_response(response)
+
+
+class CookiesTransport(AbstractCookiesTransport, xmlrpclib.Transport):
+    """Concrete implementation of an AbstractCookiesTransport that handles HTTP
+    transactions to an XML-RPC server.
+    """
+    pass
+
+
+class SafeCookiesTransport(AbstractCookiesTransport, xmlrpclib.SafeTransport):
+    """Concrete implementation of an AbstractCookiesTransport that handles
+    HTTPS transactions to an XML-RPC server.
+    """
+    pass
